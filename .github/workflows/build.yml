@@ -1,0 +1,267 @@
+name: build-munch
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: publish a release with the built kernel
+        type: boolean
+        default: true
+      jobs:
+        description: make -j for the kernel build
+        type: string
+        default: "4"
+      qemu:
+        description: boot the kernel in QEMU as a smoke test (non-fatal)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  HAKIOS_REPO: thyids/hakios-xiaomi-munch
+  HAKIOS_SHA: 908d271cff6277d29d3951496980817ed3d6e4db
+  TC: /opt/unixnu
+  THEOS: ${{ github.workspace }}/theos
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  kernel:
+    name: HakiOS munch (SM8250-AC) kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout hakios-xiaomi-munch @ 908d271 (v1.0-k40s-ufs)
+        uses: actions/checkout@v4
+        with:
+          repository: thyids/hakios-xiaomi-munch
+          ref: 908d271cff6277d29d3951496980817ed3d6e4db
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/share/swift /opt/az 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential make git curl ca-certificates tar xz-utils zstd \
+            clang lld llvm flex bison m4 perl python3 autoconf automake libtool pkg-config \
+            libssl-dev libncurses-dev uuid-dev zlib1g-dev libbz2-dev liblzma-dev \
+            cpio rsync file bsdextrautils lz4 lame
+          sudo apt-get install -y --no-install-recommends 7zip || sudo apt-get install -y --no-install-recommends p7zip-full || true
+          echo "--- versions ---"
+          clang --version | head -2
+          flex --version; bison --version | head -1; lld-link --version || true
+
+      - name: Install the Linux XNU toolchain (cctools ld64, mig, patched clang)
+        run: |
+          set -euo pipefail
+          URL=$(curl -fsSL https://api.github.com/repos/ilylty/unixnu-toolchain/releases/latest \
+                | grep -o 'https://[^"]*\.tar\.zst"' | head -1 | tr -d '"')
+          echo "toolchain: $URL"
+          curl -fsSL -o /tmp/tc.tar.zst "$URL"
+          curl -fsSL -o /tmp/tc.sha256 "${URL}.sha256" || true
+          if [ -s /tmp/tc.sha256 ]; then
+            ( cd /tmp && echo "$(awk '{print $1}' /tmp/tc.sha256)  tc.tar.zst" | sha256sum -c - )
+          fi
+          sudo mkdir -p /opt
+          sudo tar -C /opt --zstd -xf /tmp/tc.tar.zst
+          sudo ln -sfn /opt/unixnu-linux /opt/unixnu
+          sudo chmod -R a+rX /opt/unixnu-linux
+          ls /opt/unixnu
+          echo "--- components ---"
+          ls /opt/unixnu/llvm/bin | head
+          ls /opt/unixnu/CommandLineTools/usr/bin || true
+          ls /opt/unixnu/CommandLineTools/usr/libexec || true
+          test -x /opt/unixnu/CommandLineTools/usr/bin/ld
+
+      - name: Lay out theos (cctools + iPhoneOS16.5.sdk)
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/toolchain/linux/iphone/bin" "$THEOS/sdks"
+          B=/opt/unixnu/CommandLineTools/usr/bin
+          for t in ld ld64 nm otool strip lipo libtool ar ranlib install gm4 mig size; do
+            [ -e "$B/$t" ] && ln -sfn "$B/$t" "$THEOS/toolchain/linux/iphone/bin/$t" || true
+          done
+          for t in nmedit ctf_insert codesign_allocate install_name_tool; do
+            [ -e "$B/$t" ] && ln -sfn "$B/$t" "$THEOS/toolchain/linux/iphone/bin/$t" || true
+          done
+          [ -e /opt/unixnu/CommandLineTools/usr/libexec/migcom ] && \
+            ln -sfn /opt/unixnu/CommandLineTools/usr/libexec/migcom "$THEOS/toolchain/linux/iphone/bin/migcom" || true
+          echo "--- cctools ---"
+          ls -l "$THEOS/toolchain/linux/iphone/bin"
+          "$THEOS/toolchain/linux/iphone/bin/ld" -v 2>&1 | head -3 || true
+
+          echo "--- iPhoneOS16.5.sdk (theos/sdks, sparse) ---"
+          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$THEOS/sdks-git"
+          git -C "$THEOS/sdks-git" sparse-checkout set iPhoneOS16.5.sdk
+          ln -sfn ../sdks-git/iPhoneOS16.5.sdk "$THEOS/sdks/iPhoneOS16.5.sdk"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include"
+          du -sh "$THEOS/sdks-git/iPhoneOS16.5.sdk"
+
+      - name: Point the kernel's clang wrapper at the patched clang
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ ! -e /opt/unixnu/llvm/bin/clang++ ]; then sudo ln -sfn /opt/unixnu/llvm/bin/clang /opt/unixnu/llvm/bin/clang++; fi
+          sed -i 's|exec /usr/bin/$drv|exec "${XNU_CC_DIR:-/usr/bin}/$drv"|' xnu-deps/host/bin/xnu-clang
+          grep -n 'exec "${XNU_CC_DIR' xnu-deps/host/bin/xnu-clang
+          chmod +x xnu-deps/host/bin/xnu-clang xnu-deps/setup.sh xnu/apply.sh xnu-build.sh tools/make-kernel.sh
+          # mig / migcom from the toolchain: setup.sh then skips building bootstrap_cmds
+          mkdir -p xnu-deps/host/bin
+          ln -sfn /opt/unixnu/CommandLineTools/usr/bin/mig xnu-deps/host/bin/mig
+          ln -sfn /opt/unixnu/CommandLineTools/usr/libexec/migcom xnu-deps/host/bin/migcom
+          ls -l xnu-deps/host/bin/mig xnu-deps/host/bin/migcom
+
+      - name: Apple's XNU 8796.121.2 + HakiOS patch + HFS+ (xnu/apply.sh)
+        working-directory: src
+        run: ./xnu/apply.sh 2>&1 | tee xnu-apply.log
+
+      - name: Kernel dependencies (xnu-deps/setup.sh - host tools, SDK, firehose and pthread libs)
+        working-directory: src
+        env:
+          XNU_CC_DIR: /opt/unixnu/llvm/bin
+        run: |
+          set -o pipefail
+          ./xnu-deps/setup.sh 2>&1 | tee xnu-deps-setup.log
+
+      - name: Configuration (make munch_defconfig DEVICE=munch)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          make munch_defconfig DEVICE=munch
+          echo "--- .config (head) ---"
+          head -30 .config
+          echo "--- boot arguments ---"
+          python3 tools/hakios-config.py args | tee boot-args.txt
+
+      - name: Build the kernel (make kernel)
+        working-directory: src
+        env:
+          XNU_CC_DIR: /opt/unixnu/llvm/bin
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          set -o pipefail
+          make kernel DEVICE=munch JOBS="${JOBS:-4}" 2>&1 | tee kernel-build.log
+          ls -l hakios-kernel
+
+      - name: Build the loader (placeholder identity) and the open kernel's hello
+        working-directory: src
+        run: |
+          set -o pipefail
+          make loader-open 2>&1 | tee loader-build.log
+          make hello 2>&1 | tee hello-build.log
+          ls -l xnuloader/loader.efi userland/hello
+
+      - name: Make the payload the loader takes
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ARGS=$(python3 tools/hakios-config.py args)
+          echo "cmdline: $ARGS"
+          python3 xnuloader/mkpayload.py -o payload.bin \
+            kernel=hakios-kernel ramdisk=userland/hello --cmdline "$ARGS"
+          ls -l payload.bin
+
+      - name: Smoke test in QEMU (non-fatal)
+        if: ${{ inputs.qemu }}
+        working-directory: src
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          sudo apt-get install -y --no-install-recommends qemu-system-arm qemu-efi-aarch64 || true
+          qemu-system-aarch64 --version | head -2 || true
+          mkdir -p logs
+          bash qemu/run.sh 120 2>&1 | tee logs/qemu-open.log || true
+          echo "--- last lines ---"
+          tail -60 logs/qemu-open.log || true
+
+      - name: Checksums and summary
+        if: always()
+        working-directory: src
+        run: |
+          {
+            echo "HakiOS munch build"
+            echo "repository: ${HAKIOS_REPO}@${HAKIOS_SHA}"
+            echo "runner: $(uname -srm)"
+            echo "date: $(date -u +%FT%TZ)"
+            echo
+          } > BUILD-INFO.txt
+          for f in hakios-kernel xnuloader/loader.efi userland/hello payload.bin; do
+            [ -f "$f" ] && sha256sum "$f" >> SHA256SUMS || true
+          done
+          cat SHA256SUMS 2>/dev/null || true
+          echo "--- kernel identity ---"
+          file hakios-kernel 2>/dev/null || true
+          strings -a hakios-kernel 2>/dev/null | grep -m3 -E 'Darwin Kernel Version|hakios' || true
+
+      - name: Upload build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hakios-munch-kernel
+          path: |
+            src/hakios-kernel
+            src/payload.bin
+            src/xnuloader/loader.efi
+            src/userland/hello
+            src/.config
+            src/boot-args.txt
+            src/BUILD-INFO.txt
+            src/SHA256SUMS
+            src/kernel-build.log
+            src/xnu-apply.log
+            src/xnu-deps-setup.log
+            src/loader-build.log
+            src/logs/qemu-open.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish a release
+        if: ${{ always() && inputs.publish && hashFiles('src/hakios-kernel') != '' }}
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: build-${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "HakiOS munch kernel $TAG (908d271)" \
+            --notes "Built in GitHub Actions from ${HAKIOS_REPO}@${HAKIOS_SHA} (release v1.0-k40s-ufs).
+
+          Kernel: hakios-kernel (XNU 8796.121.2 + HakiOS patch + munch drivers, munch_defconfig).
+          Loader: loader.efi (placeholder identity, `make loader-open`).
+          Payload: payload.bin (kernel + hello ramdisk) for `qemu-open` / the loader device.
+
+          Not built here (needs the iPhone X 16.5 IPSW and the phone's own firmware): userland/system.apfs, root.apfs, Sileo image." \
+            hakios-kernel \
+            xnuloader/loader.efi \
+            payload.bin \
+            BUILD-INFO.txt \
+            SHA256SUMS
+          echo "release: $TAG"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## HakiOS munch (SM8250-AC) build"
+            echo
+            echo "source: \`${HAKIOS_REPO}@${HAKIOS_SHA}\` (tag v1.0-k40s-ufs)"
+            echo
+            echo "| step | result |"
+            echo "|---|---|"
+            echo "| xnu/apply.sh | see the logs above |"
+            echo
+            echo "outputs: \`hakios-kernel\`, \`loader.efi\`, \`payload.bin\` in the artifact \`hakios-munch-kernel\`"
+          } >> "$GITHUB_STEP_SUMMARY" || true
